@@ -3,6 +3,9 @@ import sys
 import argparse
 from pathlib import Path
 from typing import Optional
+import os
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
 # add evals folder to sys.path
 evals_path = Path(__file__).resolve().parent / "evals"
 sys.path.insert(0, str(evals_path))

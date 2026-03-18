@@ -13,7 +13,11 @@ RUN apt-get update && apt-get install -y \
 
 COPY environment.yml ./
 COPY requirements.txt ./
-RUN conda env create -f environment.yml && conda clean -afy
+RUN conda create -n alfworld-env python=3.11 pip -c conda-forge -y && \
+    conda run -n alfworld-env pip install "setuptools==78.1.1" && \
+    conda run -n alfworld-env pip install --no-build-isolation visdom==0.2.4 && \
+    conda run -n alfworld-env pip install -r requirements.txt && \
+    conda clean -afy
 
 SHELL ["conda", "run", "-n", "alfworld-env", "/bin/bash", "-c"]
 

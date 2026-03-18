@@ -3,3 +3,4 @@ rich
 jsonschema
 scipy
 dotenv
+PyYAML

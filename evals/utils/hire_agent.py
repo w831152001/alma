@@ -9,7 +9,7 @@ from scipy.spatial.distance import cosine
 from dotenv import load_dotenv
 from logger import get_logger
 log = get_logger("main")
-load_dotenv()
+load_dotenv(dotenv_path=os.environ.get("DOTENV_PATH"), override=True)
 
 # ---------------- Hire Agent ----------------
 class Agent:

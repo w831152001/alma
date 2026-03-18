@@ -51,7 +51,7 @@ async def run_evaluation(
             echo "AlfWorld data not found. Downloading..." && \
             mkdir -p "$ALFWORLD_DATA_DIR" && \
             export ALFWORLD_DATA="$ALFWORLD_DATA_DIR" && \
-            python /opt/evals/data/alfworld-download ; \
+            alfworld-download --data-dir "$ALFWORLD_DATA_DIR" ; \
         fi && \
         """
 

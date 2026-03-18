@@ -1,1 +1,1 @@
-docker build -t alfworld:latest .
+docker buildx build --platform linux/amd64 -t alfworld:latest --load .
