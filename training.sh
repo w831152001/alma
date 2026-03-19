@@ -15,7 +15,8 @@ python run_main.py \
     --batch_max_update_concurrent 10 \
     --batch_max_retrieve_concurrent 10 \
     --task_type textworld \
-    --status train 
+    --status train \
+    --train_size 1
 
 python run_main.py \
     --rollout_type batched \

@@ -1,547 +1,757 @@
 import re
 import json
+import time
 import uuid
-import asyncio
-from abc import ABC
+from typing import Any, Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Any, List, Tuple, DefaultDict
-from collections import defaultdict, Counter
 
 import networkx as nx
-from langchain_chroma import Chroma
-
 from agents.memo_structure import Sub_memo_layer, MemoStructure
 from eval_envs.base_envs import Basic_Recorder
 from utils.hire_agent import Agent, Embedding
+from langchain_chroma import Chroma
 
 
-# ---------------------------- Utility functions ---------------------------- #
+# ---------------------------- Utilities ----------------------------
 
-_RELATION_KEYWORDS = [
-    "under", "on", "in", "inside", "into", "behind", "near", "beneath", "above"
-]
-
-
-def _normalize_obj_name(token: str) -> str:
-    """
-    Convert 'alarmclock 1' -> 'alarmclock'; 'desk 2' -> 'desk'
-    Lowercases and trims digits at the end.
-    """
-    token = token.strip().lower()
-    parts = token.split()
-    if parts and parts[-1].isdigit():
-        parts = parts[:-1]
-    return " ".join(parts)
-
-
-def _extract_go_to_targets(actions_list: List[str]) -> List[str]:
-    targets = []
-    for a in actions_list or []:
-        if a.lower().startswith("go to "):
-            tgt = a[6:].strip()
-            targets.append(tgt)
-    return targets
-
-
-def _extract_location_from_obs(obs: str) -> Optional[str]:
-    # Example: "You arrive at desk 1."
-    m = re.search(r"You arrive at (?:the )?([a-zA-Z0-9 _\-]+?)\.", obs, re.IGNORECASE)
+def _extract_room_name(text: str) -> Optional[str]:
+    if not text:
+        return None
+    m = re.search(r"-=\s*(.*?)\s*=-", text)
     if m:
-        return m.group(1).strip().lower()
+        name = m.group(1).strip()
+        if name:
+            return name
+    # Fallback: first non-empty line up to punctuation
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if len(line) < 80:
+            return re.sub(r"[^A-Za-z0-9 _-]", "", line)
     return None
 
 
-def _extract_visible_from_obs(obs: str) -> List[str]:
-    # Try patterns like:
-    # "you see a bed 1, a desk 1, a drawer 17, ..."
-    # "On the desk 1, you see a alarmclock 1, a bowl 1, ..."
-    # "Inside the fridge 1, you see a apple 1, ..."
-    text = obs.replace("\n", " ").lower()
-    # Find the segment "... you see ... ."
-    m = re.search(r"you see (.+?)(?:\.|$)", text, re.IGNORECASE)
-    if not m:
+def _extract_directions(text: str) -> List[str]:
+    if not text:
         return []
-    segment = m.group(1)
-
-    # Unify separators: ", and a " -> ", a ", " and a " -> ", a ", same for "an"
-    segment = re.sub(r"\band an\b", ", an", segment)
-    segment = re.sub(r"\band a\b", ", a", segment)
-    segment = re.sub(r"\b, and an\b", ", an", segment)
-    segment = re.sub(r"\b, and a\b", ", a", segment)
-
-    # Split by ", a " or ", an " or leading "a " / "an "
-    items = []
-    # Ensure first starts with a/an if not already; handle cases like "a bed 1, a desk 1..."
-    # Split naive by ", "
-    raw_items = [x.strip() for x in segment.split(",") if x.strip()]
-    for it in raw_items:
-        # Remove leading 'a ' or 'an '
-        it = re.sub(r"^(a|an)\s+", "", it).strip()
-        if it:
-            items.append(it)
-    # Normalize names (drop trailing numbers)
-    return [_normalize_obj_name(i) for i in items]
+    dirs = set(re.findall(r"\bleading\s+([a-z]+)\b", text.lower()))
+    # Also consider "door north", "passageway east" patterns
+    dirs.update(re.findall(r"\b(?:door|passageway|portal|hatch)\s+leading\s+([a-z]+)\b", text.lower()))
+    canonical = []
+    for d in sorted(dirs):
+        if d in ["north", "south", "east", "west", "up", "down", "northeast", "northwest",
+                 "southeast", "southwest", "in", "out"]:
+            canonical.append(d)
+    return canonical
 
 
-def _parse_task_from_init_obs(obs: str) -> Dict[str, Any]:
-    """
-    Parse goal from the init observation:
-    Returns {
-        "text": str,
-        "targets": [str],            # target object types detected
-        "relation": {"type": str, "landmark": str} or None
-    }
-    """
-    result = {"text": "", "targets": [], "relation": None}
-    text = obs.strip()
-    m = re.search(r"Your task is to:\s*(.+)$", text, flags=re.IGNORECASE | re.DOTALL)
-    if m:
-        goal = m.group(1).strip()
-        result["text"] = goal
-        # Extract relation and landmark if possible
-        rel_found = None
-        for rel in _RELATION_KEYWORDS:
-            if f" {rel} " in (" " + goal.lower() + " "):
-                rel_found = rel
-                break
-        if rel_found:
-            # naive split: "look at alarmclock under the desklamp"
-            parts = goal.lower().split(rel_found)
-            left = parts[0].strip()
-            right = parts[1].strip() if len(parts) > 1 else ""
-            # Extract last noun in left and first noun in right
-            left_tokens = re.findall(r"[a-zA-Z]+", left)
-            right_tokens = re.findall(r"[a-zA-Z]+", right)
-            if left_tokens:
-                result["targets"].append(left_tokens[-1])
-            if right_tokens:
-                # landmark (e.g., desklamp)
-                result["relation"] = {"type": rel_found, "landmark": right_tokens[0]}
-        else:
-            # No relation keyword; try to extract probable target nouns.
-            # Heuristic: take nouns-like tokens excluding verbs like "look", "examine"
-            tokens = re.findall(r"[a-zA-Z]+", goal.lower())
-            stop = {"the", "a", "an", "to", "at", "and", "or", "of", "on", "in", "under",
-                    "with", "from", "into", "inside", "behind", "near", "beneath", "above",
-                    "look", "examine", "open", "close", "put", "take", "go"}
-            candidates = [t for t in tokens if t not in stop]
-            if candidates:
-                # Deduplicate preserving order
-                seen = set()
-                dedup = []
-                for c in candidates:
-                    if c not in seen:
-                        seen.add(c)
-                        dedup.append(c)
-                # Keep top 1-2 as targets
-                result["targets"] = dedup[:2]
-    return result
-
-
-def _tokenize_action(action: str) -> Tuple[str, List[str]]:
-    """
-    Split action text into a verb and important object tokens (normalized).
-    Returns (verb, [objects list])
-    Examples:
-        "take alarmclock 1 from desk 1" -> ("take", ["alarmclock", "desk"])
-        "open drawer 1" -> ("open", ["drawer"])
-        "examine desk 1" -> ("examine", ["desk"])
-        "go to shelf 2" -> ("go", ["shelf"])  # we likely ignore "go"
-    """
+def _action_direction(action: str) -> Optional[str]:
+    if not action:
+        return None
     a = action.strip().lower()
-    verb = a.split()[0] if a else ""
-    # Extract object phrases after verb, remove prepositions
-    after = a[len(verb):].strip() if verb else ""
-    # Split by prepositions to keep object mentions
-    # Keep 'from', 'in', 'on', 'under', 'to' as separators.
-    objs = re.split(r"\b(from|in|on|under|to|into|inside|behind|near|beneath|above)\b", after)
-    # objs is alternating, keep non-prepositions
-    obj_tokens = []
-    for idx, seg in enumerate(objs):
-        if idx % 2 == 0:  # non-preposition segment
-            toks = seg.strip()
-            if not toks:
-                continue
-            # split by spaces, but we want type words with possible trailing number
-            name = _normalize_obj_name(toks)
-            if name:
-                # Sometimes have multiple words merged, try to keep last two if multiword
-                # For ALFWorld usually single word.
-                parts = [p for p in name.split() if p]
-                if len(parts) >= 1:
-                    # Keep the last one as primary type
-                    obj_tokens.append(parts[-1])
-    # Deduplicate
-    seen = set()
-    objects = []
-    for o in obj_tokens:
-        if o and o not in seen:
-            seen.add(o)
-            objects.append(o)
-    return verb, objects
+    # Normalize common forms
+    m = re.match(r"^(?:go|move|walk|run)\s+([a-z]+)$", a)
+    if m:
+        return m.group(1)
+    # Single-token directions
+    if a in ["north", "south", "east", "west", "up", "down", "n", "s", "e", "w", "u", "d"]:
+        mapping = {"n": "north", "s": "south", "e": "east", "w": "west", "u": "up", "d": "down"}
+        return mapping.get(a, a)
+    return None
 
 
-# ---------------------------- Memory Layers ---------------------------- #
-
-@dataclass
-class AffordanceMemory(Sub_memo_layer):
-    """
-    Object affordance memory:
-    - Database: Dict[str, Counter] mapping object_type -> counts of verbs taken on that object.
-    - Update: parse 'action_took' across steps to increment verb counts for mentioned objects.
-    - Retrieve: given target object types, return ranked list of likely actions for each.
-    """
-    layer_intro: str = (
-        "AffordanceMemory: A mapping of object types to common action verbs observed in past trajectories. "
-        "database = Dict[object_type:str, Counter(verb->count)]. "
-        "Update by parsing actions taken; Retrieve returns top verbs per object type."
-    )
-    database: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
-
-    async def retrieve(self, **kwargs) -> Dict[str, List[str]]:
-        targets: List[str] = kwargs.get("targets", []) or []
-        top_k: int = kwargs.get("top_k", 5)
-        res: Dict[str, List[str]] = {}
-        for t in targets:
-            t_norm = _normalize_obj_name(t)
-            counter = self.database.get(t_norm, Counter())
-            if not counter:
-                # Provide conservative defaults when unknown
-                defaults = ["examine", "open", "close", "take", "put"]
-                res[t_norm] = defaults[:top_k]
-            else:
-                res[t_norm] = [v for v, _ in counter.most_common(top_k)]
-        return res
-
-    async def update(self, **kwargs) -> None:
-        steps: List[Dict[str, Any]] = kwargs.get("steps", []) or []
-        if not isinstance(self.database, dict):
-            self.database = defaultdict(Counter)
-        for st in steps:
-            actions = st.get("action_took", [])
-            if not actions:
-                continue
-            action = actions[0] if isinstance(actions, list) else str(actions)
-            verb, objs = _tokenize_action(action)
-            if not verb or not objs:
-                continue
-            if verb == "go":
-                continue  # navigation not an affordance of objects
-            for obj in objs:
-                self.database[obj][verb] += 1
+def _extract_objects_simple(text: str) -> List[str]:
+    if not text:
+        return []
+    # Heuristics: capture nouns after "You see" or items split by commas
+    objs: Set[str] = set()
+    for line in text.splitlines():
+        l = line.strip()
+        if not l:
+            continue
+        m = re.search(r"You see (.+?)[\.\n]", l, flags=re.IGNORECASE)
+        if m:
+            raw = m.group(1)
+            # Remove articles and descriptors
+            parts = re.split(r",| and ", raw)
+            for p in parts:
+                noun = re.sub(r"\b(a|an|the)\b", "", p, flags=re.IGNORECASE).strip()
+                noun = re.sub(r"[^A-Za-z0-9 _-]", "", noun)
+                noun = re.sub(r"\s+", " ", noun).strip()
+                if noun:
+                    objs.add(noun)
+        # Capture object-like phrases: "There is a X", "There is an X"
+        m2 = re.findall(r"There is (?:a|an|the)\s+([A-Za-z0-9 _-]+?)[\.\n]", l, flags=re.IGNORECASE)
+        for n in m2:
+            noun = re.sub(r"[^A-Za-z0-9 _-]", "", n).strip()
+            if noun:
+                objs.add(noun)
+    return sorted(objs)
 
 
-@dataclass
-class SpatialGraphMemory(Sub_memo_layer):
-    """
-    Spatial and state co-occurrence memory:
-    - Database: networkx.Graph
-        Nodes:
-            - object:<type>    kind='object'
-            - location:<type>  kind='location'
-        Edges location<->object with attributes:
-            - count: int       times observed
-            - success: int     successes associated with this co-occurrence
-    - Update: parse each observation to extract current location and visible objects.
-    - Retrieve: given targets and current reachable locations, suggest best candidate locations by frequency.
-    """
-    layer_intro: str = (
-        "SpatialGraphMemory: Maintains a bipartite graph of location types and object types with counts and success. "
-        "Nodes: object:<type> (kind='object'), location:<type> (kind='location'). "
-        "Edges track count and success-weighted observations."
-    )
-    database: nx.Graph = field(default_factory=nx.Graph)
-
-    def _ensure_location_node(self, loc_type: str) -> str:
-        node = f"location:{loc_type}"
-        if node not in self.database:
-            self.database.add_node(node, kind="location", name=loc_type)
-        return node
-
-    def _ensure_object_node(self, obj_type: str) -> str:
-        node = f"object:{obj_type}"
-        if node not in self.database:
-            self.database.add_node(node, kind="object", name=obj_type)
-        return node
-
-    async def retrieve(self, **kwargs) -> Dict[str, List[Dict[str, Any]]]:
-        targets: List[str] = kwargs.get("targets", []) or []
-        reachable: List[str] = kwargs.get("reachable", []) or []
-        # Map reachable instance names -> types
-        reachable_types = [_normalize_obj_name(r) for r in reachable]
-        reachable_base_types = [t for t in set(reachable_types)]
-
-        suggestions: Dict[str, List[Dict[str, Any]]] = {}
-        for t in targets:
-            t_norm = _normalize_obj_name(t)
-            obj_node = f"object:{t_norm}"
-            if obj_node not in self.database:
-                # No prior: return generic containers likely in ALF domains
-                generic = ["desk", "table", "shelf", "drawer", "dresser", "cabinet", "counter", "bed", "sofa"]
-                ranked = [g for g in generic if g in reachable_base_types] or generic
-                suggestions[t_norm] = [{"location_type": r, "score": 0.0, "reason": "no prior memory"} for r in ranked[:5]]
-                continue
-
-            # Aggregate counts per location type from edges connected to object node
-            loc_scores: Counter = Counter()
-            succ_scores: Counter = Counter()
-            for neighbor in self.database.neighbors(obj_node):
-                if not str(neighbor).startswith("location:"):
-                    continue
-                edge = self.database.get_edge_data(obj_node, neighbor) or {}
-                count = edge.get("count", 0)
-                succ = edge.get("success", 0)
-                loc_type = self.database.nodes[neighbor].get("name", neighbor.replace("location:", ""))
-                loc_scores[loc_type] += count
-                succ_scores[loc_type] += succ
-
-            # Combine success signal first then count
-            combined = []
-            for lt, c in loc_scores.items():
-                s = succ_scores.get(lt, 0)
-                score = 2.0 * s + 1.0 * c
-                combined.append((lt, score, s, c))
-            combined.sort(key=lambda x: x[1], reverse=True)
-
-            # Filter to reachable if available
-            filtered = [x for x in combined if x[0] in reachable_base_types] or combined
-            out_list = []
-            for lt, sc, s, c in filtered[:8]:
-                reason = f"freq={c}, success={s}"
-                out_list.append({"location_type": lt, "score": float(sc), "reason": reason})
-            suggestions[t_norm] = out_list
-        return suggestions
-
-    async def update(self, **kwargs) -> None:
-        steps: List[Dict[str, Any]] = kwargs.get("steps", []) or []
-        final_reward: float = float(kwargs.get("reward", 0.0) or 0.0)
-        success_flag = 1 if final_reward and final_reward > 0 else 0
-
-        for st in steps:
-            obs = st.get("obs", "") or ""
-            location_label = _extract_location_from_obs(obs)
-            if not location_label:
-                # could still contain list "you see ..." in the initial screen without arrival
-                # but we need a container/location context; skip if unknown
-                continue
-            loc_type = _normalize_obj_name(location_label)
-
-            visible_objs = _extract_visible_from_obs(obs)
-            if not visible_objs:
-                continue
-
-            loc_node = self._ensure_location_node(loc_type)
-            for obj_name in visible_objs:
-                obj_type = _normalize_obj_name(obj_name)
-                obj_node = self._ensure_object_node(obj_type)
-                if not self.database.has_edge(loc_node, obj_node):
-                    self.database.add_edge(loc_node, obj_node, count=0, success=0)
-                self.database.edges[loc_node, obj_node]["count"] += 1
-                if success_flag:
-                    self.database.edges[loc_node, obj_node]["success"] += 1
+def _canonical_task_id(goal: str, start_room: Optional[str]) -> str:
+    base = f"{(goal or '').strip()}\n{(start_room or '').strip()}"
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, base))
 
 
-@dataclass
-class TrajectoryIndexMemory(Sub_memo_layer):
-    """
-    Trajectory-level memory using vector search (Chroma).
-    - Stores completed episodes: task text, brief summary, outcomes.
-    - Retrieve similar tasks for transfer hints.
-    """
-    layer_intro: str = (
-        "TrajectoryIndexMemory: Vector index over past episode summaries using Chroma. "
-        "page_content stores a concise summary. Metadata is flat: "
-        "{type:'trajectory', reward:float, success:bool, task: <task text>}"
-    )
-    database: Optional[Chroma] = None
-    embedder: Optional[Embedding] = None
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
 
-    def __post_init__(self):
-        if self.database is None:
-            self.database = Chroma(embedding_function=self.embedder or Embedding())
 
-    async def retrieve(self, **kwargs) -> List[Dict[str, Any]]:
-        query: str = kwargs.get("query", "") or ""
-        k: int = int(kwargs.get("k", 4) or 4)
-        if not query.strip():
-            return []
+def _reward_to_confidence(r: float) -> float:
+    # Map reward [0,1] to confidence [0.2, 0.95]
+    r = max(0.0, min(1.0, r))
+    return round(0.2 + 0.75 * r, 3)
+
+
+def _detect_failure_text(obs: str) -> bool:
+    if not obs:
+        return False
+    fail_markers = [
+        "you can't", "you cannot", "that's not possible", "you fail", "unable to",
+        "doesn't work", "won't work", "is locked", "no such thing", "don't have that",
+    ]
+    o = obs.lower()
+    return any(m in o for m in fail_markers)
+
+
+def _estimate_action_success(prev_score: Optional[float], next_score: Optional[float], obs: str) -> bool:
+    # Simple heuristic: improved score and no failure text
+    if _detect_failure_text(obs):
+        return False
+    if (prev_score is not None) and (next_score is not None):
+        return next_score >= prev_score
+    return True
+
+
+# ---------------------------- Layers ----------------------------
+
+class TaskParsingLayer(Sub_memo_layer):
+    def __init__(self) -> None:
+        super().__init__(
+            layer_intro="Parse initial observation/goal into structured fields.",
+            database=None,
+        )
+        self.parser_agent = Agent(
+            model="gpt-4o-mini",
+            system_prompt=(
+                "Extract structured fields from a TextWorld initial observation and goal. "
+                "Be concise and avoid hallucinations. Use only what is explicitly present."
+            ),
+            output_schema={
+                "start_room": {"type": ["string", "null"], "description": "Room name from header like '-= Room =-'"},
+                "exits": {"type": "string", "description": "Comma-separated canonical directions"},
+                "objects": {"type": "string", "description": "Comma-separated object names present in the start obs"},
+                "goal_key_phrases": {"type": "string", "description": "Comma-separated essential goal keywords"},
+            },
+        )
+
+    async def retrieve(self, **kwargs) -> Dict[str, Any]:
+        init: Dict[str, Any] = kwargs.get("init", {})
+        goal: str = (init.get("goal") or "").strip()
+        obs: str = (init.get("obs") or "").strip()
+
+        # Local parse
+        start_room = _extract_room_name(obs)
+        exits = _extract_directions(obs)
+        objects = _extract_objects_simple(obs)
+
+        # Refine via agent to fill missing details and keyword extraction
         try:
-            docs = self.database.similarity_search(query=query, k=k)
+            parsed = await self.parser_agent.ask(
+                f"Observation:\n{obs}\n\nGoal:\n{goal}\n\n"
+                f"Return fields with directions lowercased canonical names."
+            )
+            agent_room = (parsed.get("start_room") or "").strip() or None
+            agent_exits = [e.strip().lower() for e in (parsed.get("exits") or "").split(",") if e.strip()]
+            agent_objects = [o.strip() for o in (parsed.get("objects") or "").split(",") if o.strip()]
+            goal_kps = [k.strip() for k in (parsed.get("goal_key_phrases") or "").split(",") if k.strip()]
         except Exception:
-            return []
-        results: List[Dict[str, Any]] = []
-        for d in docs:
-            results.append({
-                "summary": d.page_content,
-                "metadata": d.metadata or {}
-            })
-        return results
+            agent_room = None
+            agent_exits = []
+            agent_objects = []
+            goal_kps = []
+
+        final_room = agent_room or start_room
+        final_exits = sorted(set(agent_exits or exits))
+        final_objects = sorted(set(agent_objects or objects))
+        parsed_out = {
+            "goal": goal,
+            "start_room": final_room,
+            "exits": final_exits,
+            "objects": final_objects,
+            "goal_key_phrases": goal_kps,
+        }
+        return parsed_out
 
     async def update(self, **kwargs) -> None:
-        init_obs: Dict[str, Any] = kwargs.get("init", {}) or {}
-        steps: List[Dict[str, Any]] = kwargs.get("steps", []) or []
-        reward: float = float(kwargs.get("reward", 0.0) or 0.0)
+        # No persistent state
+        return None
 
-        init_text = str(init_obs.get("obs", "") or "")
-        task_info = _parse_task_from_init_obs(init_text)
-        task_text = task_info.get("text", "")
 
-        # Build a compact trajectory summary
-        actions_taken: List[str] = []
-        visited_locations: List[str] = []
-        interacted_objects: Counter = Counter()
+class SemanticTaskIndexLayer(Sub_memo_layer):
+    def __init__(self) -> None:
+        super().__init__(
+            layer_intro="Chroma index of task signatures: goal + start room + start objects + reward.",
+            database=Chroma(embedding_function=Embedding()),
+        )
+        self.db: Chroma = self.database  # type: ignore
 
-        for st in steps:
-            obs = st.get("obs", "") or ""
-            act_list = st.get("action_took", [])
-            if act_list:
-                actions_taken.append(act_list[0])
-                verb, objs = _tokenize_action(act_list[0])
-                for o in objs:
-                    interacted_objects[o] += 1
-            loc = _extract_location_from_obs(obs)
-            if loc:
-                visited_locations.append(_normalize_obj_name(loc))
-
-        visited_locations = list(dict.fromkeys(visited_locations))  # dedup preserve order
-        obj_list = [o for o, _c in interacted_objects.most_common(6)]
-        success = bool(reward and reward > 0)
-
-        # Heuristic summary
-        summary_lines = [
-            f"Task: {task_text}",
-            f"Outcome: {'SUCCESS' if success else 'FAIL'} (reward={reward})",
-            f"Visited locations: {', '.join(visited_locations) if visited_locations else 'N/A'}",
-            f"Key objects: {', '.join(obj_list) if obj_list else 'N/A'}",
-        ]
-        # Include final 3 actions as key steps
-        tail_steps = actions_taken[-3:] if actions_taken else []
-        if tail_steps:
-            summary_lines.append("Final steps: " + " | ".join(tail_steps))
-
-        text_to_store = "\n".join(summary_lines)
-        meta = {
-            "type": "trajectory",
-            "reward": float(reward),
-            "success": bool(success),
-            "task": task_text[:512],
-            "visited": json.dumps(visited_locations),
-            "objects": json.dumps(obj_list)
-        }
+    async def retrieve(self, **kwargs) -> Dict[str, Any]:
+        goal: str = kwargs.get("goal", "")
+        start_room: Optional[str] = kwargs.get("start_room")
+        objects: List[str] = kwargs.get("objects", [])
+        query = f"Goal: {goal}\nStart:{start_room or ''}\nObjects:{', '.join(objects)}"
         try:
-            self.database.add_texts(
-                texts=[text_to_store],
-                metadatas=[meta],
-                ids=[str(uuid.uuid4())]
+            docs = self.db.similarity_search(query=query, k=4)
+        except Exception:
+            docs = []
+        sims: List[Dict[str, Any]] = []
+        for d in docs:
+            meta = d.metadata or {}
+            sims.append({
+                "task_id": meta.get("task_id"),
+                "reward": _safe_float(meta.get("reward"), 0.0),
+                "start_room": meta.get("start_room"),
+                "note": (d.page_content or "")[:280],
+            })
+        return {"similar_tasks": sims}
+
+    async def update(self, **kwargs) -> None:
+        recorder: Basic_Recorder = kwargs["recorder"]
+        parsed: Dict[str, Any] = kwargs.get("parsed", {})
+        strategy_ids: List[str] = kwargs.get("strategy_ids", [])
+
+        start_room = parsed.get("start_room")
+        goal = parsed.get("goal") or ""
+        objects = parsed.get("objects", [])
+        exits = parsed.get("exits", [])
+        rew = _safe_float(getattr(recorder, "reward", 0.0), 0.0)
+        task_id = _canonical_task_id(goal, start_room)
+        content = (
+            f"TASK {task_id}\n"
+            f"Goal: {goal}\n"
+            f"Start: {start_room}\n"
+            f"Objects: {', '.join(objects)}\n"
+            f"Exits: {', '.join(exits)}\n"
+            f"Reward: {rew}\n"
+            f"StrategyRefs: {', '.join(strategy_ids)}"
+        )
+        try:
+            self.db.add_texts(
+                texts=[content],
+                metadatas=[{
+                    "type": "task",
+                    "task_id": task_id,
+                    "reward": float(rew),
+                    "start_room": (start_room or ""),
+                    "timestamp": float(time.time()),
+                }],
+                ids=[f"task::{task_id}::{int(time.time())}"],
             )
         except Exception:
-            # Avoid crashing updates if vector store is not available
-            return
+            # If add fails, ignore to avoid cascading failure
+            return None
 
 
-# ---------------------------- Orchestrator ---------------------------- #
+class StrategyLibraryLayer(Sub_memo_layer):
+    def __init__(self) -> None:
+        super().__init__(
+            layer_intro="Chroma index of strategy summaries with outcomes; keyed by task semantics.",
+            database=Chroma(embedding_function=Embedding()),
+        )
+        self.db: Chroma = self.database  # type: ignore
+        self.summarizer = Agent(
+            model="gpt-4o-mini",
+            system_prompt=(
+                "Summarize a TextWorld trajectory into a compact, transferable strategy.\n"
+                "Extract key actions, preconditions, success and failure signals."
+            ),
+            output_schema={
+                "strategy": {"type": "string", "description": "One-paragraph high-level plan"},
+                "key_actions": {"type": "string", "description": "Comma-separated canonical actions"},
+                "preconditions": {"type": "string", "description": "Comma-separated needed conditions/items"},
+                "success_signals": {"type": "string", "description": "Comma-separated cues of progress"},
+                "failure_signals": {"type": "string", "description": "Comma-separated cues of mistakes"},
+            },
+        )
 
-class LayeredMemo(MemoStructure, ABC):
-    """
-    Orchestrates retrieval and updates across:
-    - AffordanceMemory
-    - SpatialGraphMemory
-    - TrajectoryIndexMemory
-    """
-    def __init__(self):
+    async def retrieve(self, **kwargs) -> Dict[str, Any]:
+        goal: str = kwargs.get("goal", "")
+        start_room: Optional[str] = kwargs.get("start_room")
+        objects: List[str] = kwargs.get("objects", [])
+        query = f"Goal: {goal}\nStart:{start_room or ''}\nObjects:{', '.join(objects)}"
+        try:
+            docs = self.db.similarity_search(query=query, k=5)
+        except Exception:
+            docs = []
+        out: List[Dict[str, Any]] = []
+        for d in docs:
+            meta = d.metadata or {}
+            r = _safe_float(meta.get("reward"), 0.0)
+            conf = _reward_to_confidence(r if meta.get("success", False) else r * 0.6)
+            out.append({
+                "summary": (d.page_content or "")[:550],
+                "confidence": conf,
+                "success": bool(meta.get("success", False)),
+            })
+        # Deduplicate by summary start
+        seen = set()
+        deduped = []
+        for s in out:
+            key = s["summary"][:120]
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(s)
+        return {"strategies": deduped[:5]}
+
+    async def update(self, **kwargs) -> Dict[str, Any]:
+        recorder: Basic_Recorder = kwargs["recorder"]
+        parsed: Dict[str, Any] = kwargs.get("parsed", {})
+        goal = parsed.get("goal") or ""
+        start_room = parsed.get("start_room") or ""
+        rew = _safe_float(getattr(recorder, "reward", 0.0), 0.0)
+        success = rew >= 0.5  # heuristic threshold
+        steps = getattr(recorder, "steps", []) or []
+        # Build plain-text trajectory for the agent
+        traj_lines: List[str] = []
+        for st in steps:
+            act = " / ".join(st.get("action_took", [])) if isinstance(st.get("action_took"), list) else (st.get("action_took") or "")
+            score = st.get("scores")
+            ob = st.get("obs") or ""
+            ob = re.sub(r"\s+", " ", ob).strip()
+            traj_lines.append(f"ACTION: {act} | SCORE: {score} | OBS: {ob[:240]}")
+        traj_text = "\n".join(traj_lines[:60])
+
+        try:
+            parsed_sum = await self.summarizer.ask(
+                f"Goal:\n{goal}\nStart room: {start_room}\nTrajectory:\n{traj_text}\n\n"
+                "Answer with compact fields that generalize beyond specific room names."
+            )
+        except Exception:
+            parsed_sum = {
+                "strategy": "Explore systematically, collect required items, manipulate containers/doors, and verify progress signals.",
+                "key_actions": "explore,inspect,take,open,unlock,use,move",
+                "preconditions": "have-required-item,reachable-location,unlocked-path",
+                "success_signals": "reward-increase,new-rooms,goal-item-acquired",
+                "failure_signals": "repeated-failure,locked-without-key,stuck-loop",
+            }
+
+        page_content = (
+            f"STRATEGY\n{parsed_sum.get('strategy', '')}\n"
+            f"KEY_ACTIONS: {parsed_sum.get('key_actions', '')}\n"
+            f"PRECONDITIONS: {parsed_sum.get('preconditions', '')}\n"
+            f"SUCCESS_SIGNS: {parsed_sum.get('success_signals', '')}\n"
+            f"FAILURE_SIGNS: {parsed_sum.get('failure_signals', '')}"
+        )
+        task_id = _canonical_task_id(goal, start_room)
+        sid = f"strategy::{task_id}::{int(time.time())}"
+        try:
+            self.db.add_texts(
+                texts=[page_content],
+                metadatas=[{
+                    "type": "strategy",
+                    "task_id": task_id,
+                    "reward": float(rew),
+                    "success": bool(success),
+                    "start_room": start_room,
+                    "timestamp": float(time.time()),
+                }],
+                ids=[sid],
+            )
+        except Exception:
+            return {"strategy_ids": []}
+        return {"strategy_ids": [sid]}
+
+
+class ObjectAffordanceLayer(Sub_memo_layer):
+    def __init__(self) -> None:
+        super().__init__(
+            layer_intro="Chroma of object affordances discovered from action-outcome pairs.",
+            database=Chroma(embedding_function=Embedding()),
+        )
+        self.db: Chroma = self.database  # type: ignore
+
+    @staticmethod
+    def _parse_affordances(steps: List[Dict[str, Any]]) -> List[Tuple[str, str, Optional[str], bool]]:
+        # Returns list of (verb, obj, tool, success)
+        affordances: List[Tuple[str, str, Optional[str], bool]] = []
+        for i, st in enumerate(steps):
+            act_raw = st.get("action_took")
+            if isinstance(act_raw, list):
+                act = " ".join(act_raw).strip().lower()
+            else:
+                act = (act_raw or "").strip().lower()
+            if not act:
+                continue
+            prev_score = steps[i - 1].get("scores") if i > 0 else None
+            next_score = st.get("scores")
+            obs = st.get("obs") or ""
+            ok = _estimate_action_success(prev_score, next_score, obs)
+
+            def add(verb: str, obj: str, tool: Optional[str] = None) -> None:
+                v = verb.strip()
+                o = re.sub(r"[^A-Za-z0-9 _-]", "", obj).strip()
+                t = re.sub(r"[^A-Za-z0-9 _-]", "", tool).strip() if tool else None
+                if o:
+                    affordances.append((v, o, t or None, ok))
+
+            m = re.match(r"^(?:take|get|pick up)\s+(.+)$", act)
+            if m:
+                add("take", m.group(1))
+                continue
+            m = re.match(r"^(?:drop|leave)\s+(.+)$", act)
+            if m:
+                add("drop", m.group(1))
+                continue
+            m = re.match(r"^(?:open)\s+(.+)$", act)
+            if m:
+                add("open", m.group(1))
+                continue
+            m = re.match(r"^(?:close)\s+(.+)$", act)
+            if m:
+                add("close", m.group(1))
+                continue
+            m = re.match(r"^(?:unlock)\s+(.+)\s+with\s+(.+)$", act)
+            if m:
+                add("unlock", m.group(1), m.group(2))
+                continue
+            m = re.match(r"^(?:put|insert|place)\s+(.+)\s+(?:in|into|inside)\s+(.+)$", act)
+            if m:
+                add("put-into", m.group(2), m.group(1))
+                continue
+            m = re.match(r"^(?:use)\s+(.+)\s+(?:on|with)\s+(.+)$", act)
+            if m:
+                add("use-on", m.group(2), m.group(1))
+                continue
+            m = re.match(r"^(?:eat|consume)\s+(.+)$", act)
+            if m:
+                add("eat", m.group(1))
+                continue
+            m = re.match(r"^(?:drink)\s+(.+)$", act)
+            if m:
+                add("drink", m.group(1))
+                continue
+            m = re.match(r"^(?:wear|put on)\s+(.+)$", act)
+            if m:
+                add("wear", m.group(1))
+                continue
+            m = re.match(r"^(?:examine|look at)\s+(.+)$", act)
+            if m:
+                add("examine", m.group(1))
+                continue
+        return affordances
+
+    async def retrieve(self, **kwargs) -> Dict[str, Any]:
+        objects: List[str] = kwargs.get("objects", [])
+        goal: str = kwargs.get("goal", "")
+        results: Dict[str, Dict[str, Any]] = {}
+        for obj in objects[:6]:  # limit fan-out
+            query = f"{obj} related to {goal}"
+            try:
+                docs = self.db.similarity_search(query=query, k=3)
+            except Exception:
+                docs = []
+            verb_stats: Dict[str, Dict[str, Any]] = {}
+            for d in docs:
+                meta = d.metadata or {}
+                verb = str(meta.get("verb") or "").strip()
+                success = bool(meta.get("success", False))
+                if not verb:
+                    continue
+                if verb not in verb_stats:
+                    verb_stats[verb] = {"count": 0, "success": 0}
+                verb_stats[verb]["count"] += 1
+                verb_stats[verb]["success"] += 1 if success else 0
+            # Rank by success rate then count
+            ranked = sorted(
+                verb_stats.items(),
+                key=lambda kv: (kv[1]["success"] / max(1, kv[1]["count"]), kv[1]["count"]),
+                reverse=True,
+            )
+            if ranked:
+                results[obj] = {
+                    "affordances": [v for v, _ in ranked[:5]],
+                    "evidence": [f"{v} ({s['success']}/{s['count']})" for v, s in ranked[:5]],
+                }
+        return {"object_affordances": results}
+
+    async def update(self, **kwargs) -> None:
+        recorder: Basic_Recorder = kwargs["recorder"]
+        parsed: Dict[str, Any] = kwargs.get("parsed", {})
+        goal = parsed.get("goal") or ""
+        start_room = parsed.get("start_room") or ""
+        steps = getattr(recorder, "steps", []) or []
+        affs = self._parse_affordances(steps)
+        if not affs:
+            return None
+        texts: List[str] = []
+        metas: List[Dict[str, Any]] = []
+        ids: List[str] = []
+        task_id = _canonical_task_id(goal, start_room)
+        ts = int(time.time())
+        for i, (verb, obj, tool, success) in enumerate(affs[:200]):
+            text = f"AFFORDANCE {verb} OBJ {obj} TOOL {tool or ''} SUCCESS {success}"
+            texts.append(text)
+            metas.append({
+                "type": "affordance",
+                "verb": verb,
+                "object": obj,
+                "tool": tool or "",
+                "success": bool(success),
+                "task_id": task_id,
+                "timestamp": float(ts),
+            })
+            ids.append(f"aff::{task_id}::{verb}::{obj}::{i}::{ts}")
+        try:
+            self.db.add_texts(texts=texts, metadatas=metas, ids=ids)
+        except Exception:
+            return None
+
+
+class FailureMemoryLayer(Sub_memo_layer):
+    def __init__(self) -> None:
+        super().__init__(
+            layer_intro="Chroma of failure modes and recovery tips mined from low-reward trajectories.",
+            database=Chroma(embedding_function=Embedding()),
+        )
+        self.db: Chroma = self.database  # type: ignore
+        self.analyzer = Agent(
+            model="gpt-4o-mini",
+            system_prompt=(
+                "Analyze failures in a TextWorld trajectory. Identify pitfalls and suggest corrective actions."
+            ),
+            output_schema={
+                "pitfalls": {"type": "string", "description": "Comma-separated pitfalls"},
+                "fixes": {"type": "string", "description": "Comma-separated recommended fixes"},
+            },
+        )
+
+    async def retrieve(self, **kwargs) -> Dict[str, Any]:
+        goal: str = kwargs.get("goal", "")
+        try:
+            docs = self.db.similarity_search(query=f"pitfalls for {goal}", k=3)
+        except Exception:
+            docs = []
+        out: List[str] = []
+        for d in docs:
+            content = (d.page_content or "").strip()
+            if content:
+                out.append(content[:400])
+        # Deduplicate
+        seen = set()
+        uniq = []
+        for p in out:
+            key = p[:120]
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(p)
+        return {"pitfalls": uniq[:3]}
+
+    async def update(self, **kwargs) -> None:
+        recorder: Basic_Recorder = kwargs["recorder"]
+        parsed: Dict[str, Any] = kwargs.get("parsed", {})
+        goal = parsed.get("goal") or ""
+        start_room = parsed.get("start_room") or ""
+        rew = _safe_float(getattr(recorder, "reward", 0.0), 0.0)
+        steps = getattr(recorder, "steps", []) or []
+
+        # Detect repetition/loops
+        actions = []
+        for st in steps:
+            act = " / ".join(st.get("action_took", [])) if isinstance(st.get("action_took"), list) else (st.get("action_took") or "")
+            actions.append(act.strip().lower())
+        loop_flag = len(actions) != len(set(actions)) and len(actions) > 6
+
+        if rew >= 0.35 and not loop_flag:
+            return None
+
+        traj = []
+        for st in steps[:80]:
+            act = " / ".join(st.get("action_took", [])) if isinstance(st.get("action_took"), list) else (st.get("action_took") or "")
+            obs = re.sub(r"\s+", " ", (st.get("obs") or "")).strip()
+            traj.append(f"ACTION: {act} | OBS: {obs[:200]}")
+        traj_text = "\n".join(traj)
+
+        try:
+            analysis = await self.analyzer.ask(
+                f"Goal:\n{goal}\nTrajectory:\n{traj_text}\n\nIdentify pitfalls and fixes."
+            )
+            pitfalls = [p.strip() for p in (analysis.get("pitfalls") or "").split(",") if p.strip()]
+            fixes = [f.strip() for f in (analysis.get("fixes") or "").split(",") if f.strip()]
+            content = f"PITFALLS: {', '.join(pitfalls)}\nFIXES: {', '.join(fixes)}"
+        except Exception:
+            content = "PITFALLS: repeated actions, missing key, wrong container\nFIXES: search new rooms, acquire key, try different containers"
+
+        task_id = _canonical_task_id(goal, start_room)
+        try:
+            self.db.add_texts(
+                texts=[content],
+                metadatas=[{
+                    "type": "pitfall",
+                    "task_id": task_id,
+                    "reward": float(rew),
+                    "loop": bool(loop_flag),
+                    "timestamp": float(time.time()),
+                }],
+                ids=[f"pit::{task_id}::{int(time.time())}"],
+            )
+        except Exception:
+            return None
+
+
+class ProceduralPathMemoryLayer(Sub_memo_layer):
+    def __init__(self) -> None:
+        super().__init__(
+            layer_intro="NetworkX graph of observed room transitions, with direction statistics.",
+            database=nx.Graph(),
+        )
+        self.graph: nx.Graph = self.database  # type: ignore
+
+    async def retrieve(self, **kwargs) -> Dict[str, Any]:
+        start_room: Optional[str] = kwargs.get("start_room")
+        exits: List[str] = kwargs.get("exits", [])
+        if not exits:
+            return {"exploration_prior": {"by_direction": [], "notes": "No exits parsed."}}
+
+        dir_scores: Dict[str, float] = {d: 0.0 for d in exits}
+        # Prefer room-specific data
+        if start_room and (start_room in self.graph):
+            for nbr in self.graph.neighbors(start_room):
+                data = self.graph.get_edge_data(start_room, nbr) or {}
+                dir_counts = data.get("dir_counts", {}) or {}
+                for d in exits:
+                    dir_scores[d] += float(dir_counts.get(d, 0))
+        # Fallback to global
+        if all(v == 0.0 for v in dir_scores.values()):
+            for u, v, data in self.graph.edges(data=True):
+                dir_counts = data.get("dir_counts", {}) or {}
+                for d in exits:
+                    dir_scores[d] += float(dir_counts.get(d, 0)) * 0.5  # down-weight global
+
+        ranked = sorted(dir_scores.items(), key=lambda kv: kv[1], reverse=True)
+        notes = "Prioritized by observed transition frequencies."
+        return {"exploration_prior": {"by_direction": [d for d, _ in ranked], "notes": notes}}
+
+    async def update(self, **kwargs) -> None:
+        recorder: Basic_Recorder = kwargs["recorder"]
+        steps = getattr(recorder, "steps", []) or []
+        if not steps:
+            return None
+
+        # Build sequence of (room, after_action_direction)
+        sequence: List[Tuple[Optional[str], Optional[str]]] = []
+        for st in steps:
+            obs = st.get("obs") or ""
+            room = _extract_room_name(obs)
+            act_raw = st.get("action_took")
+            if isinstance(act_raw, list):
+                act_text = " ".join(act_raw)
+            else:
+                act_text = act_raw or ""
+            direction = _action_direction(act_text)
+            sequence.append((room, direction))
+
+        # Update edges using consecutive room pairs where a move occurred
+        prev_room: Optional[str] = None
+        prev_dir: Optional[str] = None
+        for room, direction in sequence:
+            if prev_room and room and prev_dir:
+                if not self.graph.has_edge(prev_room, room):
+                    self.graph.add_edge(prev_room, room, dir_counts={})
+                data = self.graph.get_edge_data(prev_room, room)
+                dir_counts = data.get("dir_counts", {})
+                dir_counts[prev_dir] = dir_counts.get(prev_dir, 0) + 1
+                data["dir_counts"] = dir_counts
+                nx.set_edge_attributes(self.graph, {(prev_room, room): data})
+            prev_room = room
+            prev_dir = direction
+
+
+# ---------------------------- Orchestrator ----------------------------
+
+class TextWorldMemory(MemoStructure):
+    def __init__(self) -> None:
         super().__init__()
-        self.embedder = Embedding()
-        self.affordance = AffordanceMemory()
-        self.spatial = SpatialGraphMemory()
-        self.trajectory = TrajectoryIndexMemory(embedder=self.embedder)
+        # Initialize layers
+        self.parser = TaskParsingLayer()
+        self.task_index = SemanticTaskIndexLayer()
+        self.strategy_lib = StrategyLibraryLayer()
+        self.affordance = ObjectAffordanceLayer()
+        self.failures = FailureMemoryLayer()
+        self.paths = ProceduralPathMemoryLayer()
+
+        # Attach shared database handle if needed
+        self.database = {
+            "task_index": self.task_index.database,
+            "strategy_lib": self.strategy_lib.database,
+            "affordance": self.affordance.database,
+            "failures": self.failures.database,
+            "paths": self.paths.database,
+        }
 
     async def general_retrieve(self, recorder: Basic_Recorder) -> Dict:
-        if recorder is None or getattr(recorder, "init", None) is None:
-            raise ValueError("recorder.init is required for retrieval")
+        init = getattr(recorder, "init", {}) or {}
+        if not isinstance(init, dict):
+            raise ValueError("recorder.init must be a dict")
 
-        init_obs: Dict[str, Any] = recorder.init or {}
-        obs_text: str = str(init_obs.get("obs", "") or "")
-        actions_init: List[str] = init_obs.get("actions_list", []) or []
+        # 1) Parse task
+        parsed = await self.parser.retrieve(init=init)
+        goal = parsed.get("goal") or ""
+        start_room = parsed.get("start_room")
+        exits = parsed.get("exits", [])
+        objects = parsed.get("objects", [])
 
-        # 1) Parse task and scene
-        task_info = _parse_task_from_init_obs(obs_text)
-        visible_now = _extract_visible_from_obs(obs_text)
-        reachable_targets = _extract_go_to_targets(actions_init)
-        # Only keep target names, not 'go to ' prefix
-        reachable_instances = [r for r in reachable_targets]
-        reachable_types = [_normalize_obj_name(r) for r in reachable_instances]
+        # 2) Semantic prior queries (chain: parsed -> task_index/strategy/affordance/failures/paths)
+        similar = await self.task_index.retrieve(goal=goal, start_room=start_room, objects=objects)
+        strategies = await self.strategy_lib.retrieve(goal=goal, start_room=start_room, objects=objects)
+        afford = await self.affordance.retrieve(objects=objects, goal=goal)
+        pitfalls = await self.failures.retrieve(goal=goal)
+        path_prior = await self.paths.retrieve(start_room=start_room, exits=exits)
 
-        # 2) Retrieve similar episodes from Trajectory index
-        query = task_info.get("text", "")
-        similar_cases = await self.trajectory.retrieve(query=query, k=4)
-
-        # 3) Predict promising locations from Spatial graph memory
-        spatial_suggestions = await self.spatial.retrieve(
-            targets=task_info.get("targets", []),
-            reachable=reachable_instances
-        )
-
-        # 4) Affordance suggestions for key target objects and landmarks
-        affordance_targets = list(set(task_info.get("targets", []) +
-                                     ([task_info["relation"]["landmark"]]
-                                      if task_info.get("relation") else [])))
-        affordances = await self.affordance.retrieve(
-            targets=affordance_targets,
-            top_k=5
-        )
-
-        # 5) Synthesize a ranked visitation plan per target:
-        visitation_plan: Dict[str, List[str]] = {}
-        for t, locs in spatial_suggestions.items():
-            # Rank by score and keep only those that are actually reachable
-            ranked_types = [x["location_type"] for x in locs]
-            # Map ranked types to current instances of same type
-            # Prefer those that are currently reachable
-            instance_scores = []
-            for inst in reachable_instances:
-                inst_type = _normalize_obj_name(inst)
-                if inst_type in ranked_types:
-                    score = next((x["score"] for x in locs if x["location_type"] == inst_type), 0.0)
-                    instance_scores.append((inst, score))
-            instance_scores.sort(key=lambda x: x[1], reverse=True)
-            visitation_plan[t] = [i for i, _s in instance_scores][:5] or reachable_instances[:5]
-
-        # 6) Prepare clean output for agent
-        out = {
-            "task": {
-                "text": task_info.get("text", ""),
-                "targets": task_info.get("targets", []),
-                "relation": task_info.get("relation", None)
+        # 3) Compose clean, compact output
+        output = {
+            "task_brief": {
+                "goal": goal,
+                "start_room": start_room or "",
+                "exits": exits,
+                "objects_seen": objects,
             },
-            "scene": {
-                "visible_objects": visible_now,
-                "reachable_locations": reachable_instances,
-            },
-            "knowledge": {
-                "likely_locations": spatial_suggestions,
-                "affordances": affordances,
-                "visitation_plan": visitation_plan,
-                "similar_cases": similar_cases
-            },
-            "meta": {
-                "coverage": {
-                    "affordance_objects": len(self.affordance.database or {}),
-                    "spatial_nodes": int(self.spatial.database.number_of_nodes()
-                                         if isinstance(self.spatial.database, nx.Graph) else 0),
-                }
-            }
+            "exploration_prior": path_prior.get("exploration_prior", {"by_direction": [], "notes": ""}),
+            "retrieved_strategies": strategies.get("strategies", []),
+            "object_affordances": afford.get("object_affordances", {}),
+            "pitfalls": pitfalls.get("pitfalls", []),
+            "similar_past_tasks": similar.get("similar_tasks", []),
         }
-        return out
+        # Store into recorder for downstream visibility if needed
+        recorder.memory_retrieved = output
+        return output
 
     async def general_update(self, recorder: Basic_Recorder) -> None:
-        if recorder is None:
-            raise ValueError("recorder is required for update")
+        init = getattr(recorder, "init", {}) or {}
+        if not isinstance(init, dict):
+            raise ValueError("recorder.init must be a dict in update")
+        # 1) Re-parse to get structured signals
+        parsed = await self.parser.retrieve(init=init)
 
-        steps: List[Dict[str, Any]] = getattr(recorder, "steps", []) or []
-        reward: float = float(getattr(recorder, "reward", 0.0) or 0.0)
-        init_obs: Dict[str, Any] = getattr(recorder, "init", {}) or {}
+        # 2) Update graph paths first (purely structural)
+        await self.paths.update(recorder=recorder)
 
-        # Order: Affordances (local action stats) -> Spatial graph (co-occurrence) -> Trajectory index (episodic)
-        await self.affordance.update(steps=steps, reward=reward)
-        await self.spatial.update(steps=steps, reward=reward)
-        await self.trajectory.update(init=init_obs, steps=steps, reward=reward)
+        # 3) Update affordances from action-outcome pairs
+        await self.affordance.update(recorder=recorder, parsed=parsed)
+
+        # 4) Summarize and store strategy, get ids to link
+        strat_info = await self.strategy_lib.update(recorder=recorder, parsed=parsed)
+        strategy_ids = strat_info.get("strategy_ids", []) if isinstance(strat_info, dict) else []
+
+        # 5) Update task semantic index linking to strategies
+        await self.task_index.update(recorder=recorder, parsed=parsed, strategy_ids=strategy_ids)
+
+        # 6) Update failures if low reward or loops
+        await self.failures.update(recorder=recorder, parsed=parsed)

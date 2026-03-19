@@ -1,9 +1,9 @@
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from typing_extensions import Literal
+import asyncio
 import numpy as np
 from eval_envs.base_envs import Basic_Env, Basic_Recorder
 import copy
-import asyncio
 
 from dataclasses import dataclass, field
 
@@ -11,35 +11,53 @@ from pathlib import Path
 import yaml
 import re
 import subprocess
+import random
 import os
+from collections import defaultdict
 from logger import get_logger
+import sys
+from pathlib import Path
+import sys, importlib, site
 
+# find site packages
+# site_packages = site.getsitepackages()
+# for p in site_packages:
+#     if p in sys.path:
+#         sys.path.remove(p)
+#     sys.path.insert(0, p)
+
+# import textworld
 try:
-    from alfworld.agents.environment import get_environment
-    from eval_envs.prompts.env_prompt import get_alfworld_prompt
+    import glob
+    import gym
+    textworld = importlib.import_module("textworld")
+    textworld_gym = importlib.import_module("textworld.gym")
+    from eval_envs.prompts.env_prompt import get_textworld_prompt
 except Exception as e:
-    pass
+    import types
+    gym = types.SimpleNamespace(
+        Wrapper=object,
+        Env=object,
+        spaces=types.SimpleNamespace(Space=object)
+    )
 
 
 log = get_logger("main")
-TASK_MAP = {
-    "train": 'train',
-    "eval_in_distribution": 'valid_seen',
-    "eval_out_of_distribution" : 'valid_unseen'
-}
+
+
 
 @dataclass
-class ALFWorldRecorder(Basic_Recorder):
+class TextworldRecorder(Basic_Recorder):
     """Recorder for a single environment interaction session."""
 
     init: Dict[str, Any] = field(
         default_factory=dict,
         metadata={
-            "description": "Stores the initial observation and info when environment is set. ",
+            "description": "Stores the initial observation. The actions may depend on tasks",
             "type": "Dict[str, Any]",
             "example":{
-                'obs': '-= Welcome to TextWorld, ALFRED! =-\n\nYou are in the middle of a room. Looking quickly around you, you see a bed 1, a desk 1, a drawer 17, a drawer 16, a drawer 15, a drawer 14, a drawer 13, a drawer 12, a drawer 11, a drawer 10, a drawer 9, a drawer 8, a drawer 7, a drawer 6, a drawer 5, a drawer 4, a drawer 3, a drawer 2, a drawer 1, a dresser 1, a garbagecan 1, a shelf 6, a shelf 5, a shelf 4, a shelf 3, a shelf 2, and a shelf 1.\n\nYour task is to: look at alarmclock under the desklamp.', 
-                'actions_list': ['go to bed 1', 'go to desk 1', 'go to drawer 1', 'go to drawer 10', 'go to drawer 11', 'go to drawer 12', 'go to drawer 13', 'go to drawer 14', 'go to drawer 15', 'go to drawer 16', 'go to drawer 17', 'go to drawer 2', 'go to drawer 3', 'go to drawer 4', 'go to drawer 5', 'go to drawer 6', 'go to drawer 7', 'go to drawer 8', 'go to drawer 9', 'go to dresser 1', 'go to garbagecan 1', 'go to shelf 1', 'go to shelf 2', 'go to shelf 3', 'go to shelf 4', 'go to shelf 5', 'go to shelf 6', 'help', 'inventory', 'look']
+                'obs': '-= Spare Room =-\nYou arrive in a spare room. A normal kind of place.\n\n\n\nThere is a closed spherical portal leading south. There is a closed door leading...', 
+                'goal': 'Please recover the latchkey from the floor of the pantry.'
                 }
             }
     )
@@ -47,14 +65,14 @@ class ALFWorldRecorder(Basic_Recorder):
     steps: List[Dict[str, Any]] = field(
         default_factory=list,
         metadata={
-            "description": "List of all recorded steps in the session.",
+            "description": "List of all recorded steps in the session. We provide an example about the content that will be stored in steps(this is only a format sample, the content might not be the same).",
             "type": "List[Dict[str, Any]]",
-            "example":[{
-                'action_took': ['go to desk 1'], 
-                'obs': 'You arrive at desk 1. On the desk 1, you see a alarmclock 1, a bowl 1, a cd 2, a cd 1, a mug 2, a mug 1, and a pencil 1.', 
-                'scores': 0, 
-                'dones': False, 
-                'actions_list': ['examine desk 1', 'go to bed 1', 'go to drawer 1', 'go to drawer 10', 'go to drawer 11', 'go to drawer 12', 'go to drawer 13', 'go to drawer 14', 'go to drawer 15', 'go to drawer 16', 'go to drawer 17', 'go to drawer 2', 'go to drawer 3', 'go to drawer 4', 'go to drawer 5', 'go to drawer 6', 'go to drawer 7', 'go to drawer 8', 'go to drawer 9', 'go to dresser 1', 'go to garbagecan 1', 'go to shelf 1', 'go to shelf 2', 'go to shelf 3', 'go to shelf 4', 'go to shelf 5', 'go to shelf 6', 'help', 'inventory', 'look', 'take alarmclock 1 from desk 1', 'take bowl 1 from desk 1', 'take cd 1 from desk 1', 'take cd 2 from desk 1', 'take mug 1 from desk 1', 'take mug 2 from desk 1', 'take pencil 1 from desk 1']
+            "example":[
+                {
+                'action_took': ['go south'], 
+                'obs': '-= Basement =-\nYou arrive in a basement. A typical one.\n\nYou see a rack. The rack is typical. However, the rack, like an empty rack, has nothing on it. It would have been so cool if there was stuff on the rack.\n\nThere is an open hatch leading east. There is an open passageway leading north.', 
+                'scores': 0.3314, 
+                'dones': 'bool, indicating whether we finish the game(not neccessarily win)'
                 }]
         }
     )
@@ -62,7 +80,7 @@ class ALFWorldRecorder(Basic_Recorder):
     reward: float = field(
         default=0.0,
         metadata={
-            "description": "Final reward assigned to the session.",
+            "description": "Final reward(progression) assigned to the session. From 0 to 1.",
             "type": "float"
         }
     )
@@ -80,141 +98,184 @@ class ALFWorldRecorder(Basic_Recorder):
     memory_retrieved: Dict = field(
         default_factory=dict)
 
-    async def log_init(self, obs: Any, actions_list: Any):
+    async def log_init(self, obs: Any, goal: Any, **kargs):
         async with self._lock:
-            self.init = {"obs": obs, "actions_list": actions_list}
+            self.init = {"obs": obs, "goal": goal}
 
-    async def log_memo_retrieved(self, memory_retrieved: Dict):
+    async def log_memo_retrieved(self, memory_retrieved: Dict, **kargs):
         async with self._lock:
             self.memory_retrieved = memory_retrieved
 
-    async def log_step(self, action_took: str, obs: Any, scores: Any, dones: Any, actions_list: Any):
+    async def log_step(self, obs: Any, scores: Any, dones: Any, action_took: Any, **kargs):
         async with self._lock:
-            self.steps.append(
-                {"action_took": action_took, "obs": obs, "scores": scores, "dones": dones, "actions_list": actions_list}
-            )
+            info = {"action_took": action_took,  "obs": obs, "scores": scores, "dones": dones}
+            self.steps.append(info)
 
-    async def set_reward(self, reward: float):
+    async def set_reward(self, reward: float, **kargs):
         async with self._lock:
             self.reward = reward
 
 
-class ALFWorld_Env(Basic_Env):
-    """Asynchronous ALFWorld environment wrapper, returns a recorder at the end of episode."""
+class Textworld_Env(Basic_Env):
+    """Asynchronous textworld environment wrapper, returns a recorder at the end of episode."""
 
-    def __init__(
-        self,
-        max_trails: int = 30,
+    def __init__(self,
+        train_size, 
         train_eval: Literal["train", "eval_in_distribution", "eval_out_of_distribution"] = "train",
-        train_size: int = 10,
         update_task: Literal["train", "eval_in_distribution", "eval_out_of_distribution"] = "eval_out_of_distribution",
-        **kargs
-    ):     
+        max_trails: int = 80,
+        **kwargs
+        ):   
 
-        #check for env path
         self.project_root = Path(__file__).resolve().parent.parent
-        default_data_path = self.project_root/"data/alfworld"
-        current_env = os.environ.get("ALFWORLD_DATA")
-
-        if current_env != str(default_data_path):
-            log.warning(f"Setting $ALFWORLD_DATA to {default_data_path}")
-            os.environ["ALFWORLD_DATA"] = str(default_data_path)
-
-        config_path = self.project_root / 'eval_envs' / 'configs' / 'env_configs.yaml'
-        config = from_yaml(config_path)
-
-        self.env_config = config
+        self.textworld_games_path = self.project_root.parent/'balrog'/'tw_games'
         self.max_trails = max_trails
-        self.train_eval = train_eval
-        self.train_size = train_size
-        self.update_task_list = self.get_files(os.path.join(self.project_root/"data/alfworld/json_2.1.1", TASK_MAP[update_task].lstrip("/")))
-        self.task_list = self.get_task()
+        config_path = self.project_root / 'eval_envs' / 'configs' / 'env_configs.yaml'
+        self.textworld_kwargs = from_yaml(config_path)
+        required_kwargs = ["objective", "description", "score", "max_score", "won"]
+        for kwarg in required_kwargs:
+            assert kwarg in self.textworld_kwargs
+        
+        self.request_infos = textworld.EnvInfos(**self.textworld_kwargs)
 
-        try:
-            self.env_template = get_environment(self.env_config["env"]["type"])(
-                self.env_config, train_eval=self.train_eval
-            )
-        except Exception as e:
-            raise RuntimeError(f"Failed to initialize ALFWorld environment template: {e}")
+        # register envs
+        self.category_to_tasks = defaultdict(list)
+        
+        for pattern in ["*.ulx", "*.z8"]:
+            for entry in sorted(glob.glob(os.path.join(self.textworld_games_path, f"**/{pattern}"), recursive=True)):
+                task = Path(entry).parent.name
+                if task in ['treasure_hunter','the_cooking_game']:
+                    env_id = textworld.gym.register_game(entry, self.request_infos, max_episode_steps=self.max_trails+10)
+                    self.category_to_tasks[task].append(env_id)
 
+        random.seed(42)
+        ood_cats = []
+
+        train_tasks = []
+        test_in_domain = []
+        test_out_of_domain = []
+
+        for cat, cat_tasks in self.category_to_tasks.items():
+            if cat in ood_cats:
+                test_out_of_domain += cat_tasks
+            else:
+                random.shuffle(cat_tasks)
+                n = len(cat_tasks)
+                train_n = int(n * 0.5)
+                train_tasks += cat_tasks[:train_n]
+                test_in_domain += cat_tasks[train_n:]
+        
+        if train_eval == 'train':
+            self.task_list = train_tasks[:min(len(train_tasks), train_size)]
+        elif train_eval == 'eval_in_distribution':
+            self.task_list = test_in_domain
+        else:
+            self.task_list = test_out_of_domain
+
+        if update_task == 'train':
+            self.update_task_list = train_tasks[:min(len(train_tasks), train_size)]
+        elif update_task == 'eval_in_distribution':
+            self.update_task_list = test_in_domain
+        else:
+            self.update_task_list = test_out_of_domain
+        
         self.recorders = {}
         self.envs = {}
 
-    def get_files(self, root_path):
-        pddl_files = []
-        for game_dir in os.listdir(root_path):
-            game_path = os.path.join(root_path, game_dir)
-            if os.path.isdir(game_path):
-                for trial_dir in os.listdir(game_path):
-                    trial_path = os.path.join(game_path, trial_dir)
-                    if os.path.isdir(trial_path):
-                        for file_name in os.listdir(trial_path):
-                            if file_name.endswith(".tw-pddl"):
-                                full_path = os.path.join(trial_path, file_name)
-                                pddl_files.append(full_path)
-        return pddl_files
 
-    def get_task(self):
-        """
-        get task file paths as list for task running
-        """        
-        if self.train_eval == 'train':
-            root_path = os.path.join(self.project_root/"data/alfworld/json_2.1.1", TASK_MAP[self.train_eval].lstrip("/"))
-            pddl_files = self.get_files(root_path)
-            pddl_files = pddl_files[:self.train_size]
-        elif self.train_eval == 'eval_in_distribution':
-            # train_root_path = os.path.join(self.project_root/"data/alfworld/json_2.1.1", TASK_MAP['train'].lstrip("/"))
-            # train_pddl_files = get_files(train_root_path)
-            # train_pddl_files = train_pddl_files[self.train_size:]
-            root_path = os.path.join(self.project_root/"data/alfworld/json_2.1.1", TASK_MAP[self.train_eval].lstrip("/"))
-            pddl_files = self.get_files(root_path)
-            # pddl_files += train_pddl_files
-            print(f'{self.train_eval} on {len(pddl_files)} games')
-        else:
-            root_path = os.path.join(self.project_root/"data/alfworld/json_2.1.1", TASK_MAP[self.train_eval].lstrip("/"))
-            pddl_files = self.get_files(root_path)
-        return pddl_files
-
-    def _clone_env(self):
-        """Create a fresh environment instance from template."""
-        return copy.deepcopy(self.env_template)
-
-    async def set_task_env(self, game_files: str) -> Any:
+    async def set_task_env(self, task: str) -> Any:
         """Initialize environment for a task and log initial observation."""
-        env = self._clone_env()
-        env.game_files = [game_files.rsplit("_runtime_", 1)[0]]
-        env = env.init_env(batch_size=1)
+    
+        env = textworld.gym.make(task.rsplit("_runtime_", 1)[0])
+        env = TextWorldWrapper(env, max_steps=self.max_trails)
 
-        alf_recorder = ALFWorldRecorder()
+        textworld_recorder = TextworldRecorder()
 
-        obs, info = env.reset()
+        obs = env.reset()
+        
+        await textworld_recorder.log_init(**obs)
 
-        await alf_recorder.log_init(obs[0], info['admissible_commands'][0])
+        self.recorders[task] = textworld_recorder
+        self.envs[task] = env
 
-        self.recorders[game_files] = alf_recorder
-        self.envs[game_files] = env
-
-        return {'obs': obs[0], 'actions_list': info['admissible_commands'][0]}, alf_recorder
+        return obs, textworld_recorder
 
     async def run_step(self, action: str, game_files: str, **kargs) -> Dict:
         """Run one step and log results."""
-        obs, scores, dones, infos = self.envs[game_files].step([action])
-
+        if len(action) >= 256:
+            raise RuntimeError(f"Action: {action} is not valid.")
+        obs, reward, done, info = self.envs[game_files].step(action)
+        # print(obs['text'], reward,done)
+        obs['action_took'] = action
+        obs['scores'] = max(info["score"] / info["max_score"], 1.0 if info["won"] else 0.0)
+        obs['dones'] = done
+        
         recorder = self.recorders[game_files]
-        await recorder.log_step(action, obs[0], scores[0], dones[0], infos['admissible_commands'][0])
-        return  {"action_took": action, "obs": obs[0], "scores": scores[0], "dones": dones[0], "actions_list": infos['admissible_commands'][0]}, recorder
+        await recorder.log_step(**obs)
+        return  obs, recorder
 
-    async def cal_reward(self, scores: float, game_files: str) -> ALFWorldRecorder:
+    async def cal_reward(self, scores: float, game_files: str) -> TextworldRecorder:
         """Store a simple binary reward and return recorder."""
         recorder = self.recorders[game_files]
+        self.envs[game_files].close() # avoid OOM
         await recorder.set_reward(scores)
         return recorder
 
-    async def get_prompt(self, obs: str, actions_list: List[str], game_files: str, memory_retrived: Dict = {}, **kargs):
-        return get_alfworld_prompt(obs, actions_list, memory_retrived, **kargs)
+    async def get_prompt(self, game_files: str, obs: str, memory_retrived: Dict = {}, goal = '', **kargs):
+        task_type = [k for k, v in self.category_to_tasks.items() if game_files.rsplit("_runtime_", 1)[0] in v][0]
+        
+        prompt = get_textworld_prompt(
+            task_type = task_type,
+            obs=obs,
+            memory_retrived=memory_retrived,
+            **kargs)
+        return prompt
         
 def from_yaml(yaml_path: str):
     """Load record_db from YAML file."""
     with open(yaml_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f) or {}
     return config
+
+class AlwaysTrue:
+    def __contains__(self, item):
+        return True
+
+class TextWorldWrapper(gym.Wrapper):
+    def __init__(self, env: gym.Env, max_steps=40):
+        super().__init__(env)
+        self.language_action_space = AlwaysTrue()
+        self.progression = 0.0
+        self.max_steps = max_steps
+        self.action_space = gym.spaces.Space()
+        self.observation_space = gym.spaces.Space()
+
+    @property
+    def default_action(self):
+        return "help"
+
+    def filter_objective(self, obs, info):
+        objective = info["objective"]
+        parts = obs.split(objective)
+        if len(parts) == 1:
+            return parts[0].strip()
+        else:
+            return parts[-1].strip()
+
+    def reset(self):
+        obs, info = self.env.reset()
+        obs = self.filter_objective(obs, info)
+        self.progression = 0.0
+        return {"obs": obs, 'goal': info["objective"]}
+
+    def step(self, action):
+        obs, reward, done, info = self.env.step(action)
+        obs = self.filter_objective(obs, info)
+
+        if done:
+            self.progression = max(info["score"] / info["max_score"], 1.0 if info["won"] else 0.0)
+
+        return {"obs": obs}, reward, done, info
+
+    def get_stats(self):
+        return {"progression": self.progression}

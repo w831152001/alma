@@ -237,6 +237,7 @@ class MetaAgent:
                         expand=True,
                     )
             task_id = progress.add_task("Running", total=2) 
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             log.info("[blue]━━━━━━━━━━━━━━━ CODE GENERATION ━━━━━━━━━━━━━━━[/blue]")
             new_code = await self.generate_new_code()
             
@@ -270,7 +271,6 @@ class MetaAgent:
         else:
             file_name = self.history_ckpt_path
         # run main loop
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         project_root = Path(__file__).resolve().parent.parent
         
         semaphore = asyncio.Semaphore(max_concurrent)

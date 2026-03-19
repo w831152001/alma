@@ -34,8 +34,12 @@ try:
     textworld_gym = importlib.import_module("textworld.gym")
     from eval_envs.prompts.env_prompt import get_textworld_prompt
 except Exception as e:
-    print(e)
-    pass
+    import types
+    gym = types.SimpleNamespace(
+        Wrapper=object,
+        Env=object,
+        spaces=types.SimpleNamespace(Space=object)
+    )
 
 
 log = get_logger("main")

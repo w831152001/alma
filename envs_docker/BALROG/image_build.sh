@@ -1,1 +1,1 @@
-docker build --file Dockerfile . --tag balrog
+docker buildx build --platform linux/amd64 --file Dockerfile . --tag balrog --load
