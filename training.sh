@@ -35,4 +35,3 @@ python run_main.py \
     --batch_max_retrieve_concurrent 10 \
     --task_type babaisai \
     --status train 
-    

@@ -29,8 +29,9 @@ async def run_evaluation(
                 update_size: Optional[int]= None,
                 update_task: Optional[str]= None):
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    base_dir = os.path.abspath(script_dir)
+    # script_dir = os.path.dirname(os.path.abspath(__file__))
+    # base_dir = os.path.abspath(script_dir)
+    base_dir = "/mnt/c/Users/USER/ALMA/alma"
     evals_dir = os.path.join(base_dir, "evals")
     memo_archive_dir = os.path.join(base_dir, "memo_archive")
     env_archive_dir = os.path.join(base_dir, "envs_archive")
@@ -96,6 +97,8 @@ async def run_evaluation(
         "bash", "-c", 
         f"{cmd}"
     ]
+
+    log.info(docker_cmd)
 
     process = await asyncio.create_subprocess_exec(
             *docker_cmd,

@@ -58,6 +58,22 @@ pip install -r requirements.txt
 OPENAI_API_KEY=your_openai_api_key_here
 ```
 
+### Docker (optional)
+The repository can also be containerized using the included `Dockerfile`:
+
+```bash
+# build the image
+docker build -t alma:latest .
+
+# run interactively (you can pass any `run_main.py` arguments after the image tag)
+# make sure to mount a volume for logs/memo_archive and provide your .env file
+docker run --rm -v "$PWD/logs":/app/logs -v "$PWD/memo_archive":/app/memo_archive \
+    --env-file .env alma:latest \
+    --task_type alfworld --status train
+```
+
+You can extend or customize the Dockerfile to include other dependencies or system packages as needed.
+
 ---
 
 ## Running Experiments

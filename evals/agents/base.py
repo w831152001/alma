@@ -7,7 +7,7 @@ from collections import defaultdict
 from logger import get_logger
 log = get_logger("main")
 from dataclasses import dataclass, field
-import openai
+# import openai
 
 @dataclass
 class TokenTracker:
